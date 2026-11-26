@@ -66,6 +66,7 @@ interface OverlayHUDProps {
   onToggleUnderwaterView: () => void;
   onToggleNarration: () => void;
   onUseBrowserNarration: () => void;
+  onChangeProvider: (provider: NarrationProvider) => void;
   onChangeVoice: (voice: NarratorVoice) => void;
   onReplayNarration: () => void;
   onToggleDock: () => void;
@@ -108,6 +109,7 @@ export function OverlayHUD({
   onToggleUnderwaterView,
   onToggleNarration,
   onUseBrowserNarration,
+  onChangeProvider,
   onChangeVoice,
   onReplayNarration,
   onToggleDock,
@@ -268,22 +270,51 @@ export function OverlayHUD({
                 </div>
               </div>
 
-              {narrationEnabled && narrationStatus === 'speaking' && (
-                <div className="flex items-center justify-between gap-2 text-[11px] text-emerald-300/95">
-                  <span>
-                    {narrationProvider === 'browser'
-                      ? 'Браузер дикторы түсіндіріп жатыр'
-                      : 'Диктор осы кезеңді түсіндіріп жатыр'}
-                  </span>
+              <div className="flex items-center justify-between gap-2 text-[11px]">
+                <div className="flex items-center gap-1 p-0.5 rounded-md bg-[#0d1826] border border-slate-800 shrink-0">
                   <button
                     type="button"
-                    onClick={onReplayNarration}
-                    className="text-slate-300 hover:text-white underline underline-offset-2 cursor-pointer whitespace-nowrap shrink-0"
+                    onClick={() => onChangeProvider('gemini')}
+                    className={`px-2 py-0.5 text-[10px] font-medium rounded transition-colors cursor-pointer whitespace-nowrap ${
+                      narrationProvider === 'gemini'
+                        ? 'bg-sky-500/25 text-sky-200'
+                        : 'text-slate-400 hover:text-slate-100'
+                    }`}
                   >
-                    Қайталау
+                    Gemini AI
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => onChangeProvider('browser')}
+                    className={`px-2 py-0.5 text-[10px] font-medium rounded transition-colors cursor-pointer whitespace-nowrap ${
+                      narrationProvider === 'browser'
+                        ? 'bg-sky-500/25 text-sky-200'
+                        : 'text-slate-400 hover:text-slate-100'
+                    }`}
+                  >
+                    Браузер
                   </button>
                 </div>
-              )}
+
+                {narrationEnabled && (
+                  <div className="flex items-center gap-2 min-w-0">
+                    <span className="text-emerald-300/95 truncate">
+                      {narrationStatus === 'speaking'
+                        ? 'Диктор оқып жатыр'
+                        : narrationStatus === 'loading'
+                          ? 'Дайындалуда...'
+                          : 'Тыңдауға дайын'}
+                    </span>
+                    <button
+                      type="button"
+                      onClick={onReplayNarration}
+                      className="text-slate-300 hover:text-white underline underline-offset-2 cursor-pointer whitespace-nowrap shrink-0"
+                    >
+                      Қайталау
+                    </button>
+                  </div>
+                )}
+              </div>
 
               {narrationStatus === 'error' && narrationError && (
                 <div className="space-y-2" role="alert">

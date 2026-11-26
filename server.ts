@@ -20,8 +20,11 @@ const ALLOWED_VOICES = new Set(['Charon', 'Kore', 'Puck', 'Fenrir', 'Zephyr']);
 const CACHE_DIR = path.resolve(__dirname, '.cache', 'tts');
 const ttsMemoryCache = new Map<string, Buffer>();
 
-// Cooldown timestamp after receiving a 429 RESOURCE_EXHAUSTED to prevent upstream request spam
-let quotaCooldownUntil = 0;
+// Ordered list of Gemini 3.8 TTS models (independent per-model quotas)
+const TTS_MODELS = ['gemini-3.8-flash-lite-tts', 'gemini-3.8-flash-tts'] as const;
+
+// Per-model cooldown timestamps after receiving 429 RESOURCE_EXHAUSTED
+const modelCooldownUntil = new Map<string, number>();
 
 function ensureCacheDir(): void {
   if (!fs.existsSync(CACHE_DIR)) {
@@ -40,8 +43,10 @@ function readCachedWav(hash: string): Buffer | null {
   if (fs.existsSync(filePath)) {
     try {
       const buf = fs.readFileSync(filePath);
-      ttsMemoryCache.set(hash, buf);
-      return buf;
+      if (buf.length > 44) {
+        ttsMemoryCache.set(hash, buf);
+        return buf;
+      }
     } catch {
       return null;
     }
@@ -103,10 +108,56 @@ function extractApiStatus(err: unknown): { status: number; isQuota: boolean; isA
   };
 }
 
-async function generateKazakhSpeechWav(text: string, voiceName: string): Promise<Buffer> {
+/**
+ * Wraps raw 24kHz mono 16-bit PCM in a standard 44-byte RIFF/WAV header if needed.
+ * Unary Gemini 3.8 TTS normally returns a complete RIFF WAV, so this is a safe guard.
+ */
+function ensureWavBuffer(rawBuffer: Buffer, mimeType?: string): Buffer {
+  const hasRiffHeader =
+    rawBuffer.length >= 12 &&
+    rawBuffer.subarray(0, 4).toString('ascii') === 'RIFF' &&
+    rawBuffer.subarray(8, 12).toString('ascii') === 'WAVE';
+
+  if (hasRiffHeader) {
+    return rawBuffer;
+  }
+
+  // Only wrap if mimeType indicates raw PCM / L16
+  if (!mimeType || mimeType.toLowerCase().includes('pcm') || mimeType.toLowerCase().includes('l16')) {
+    const sampleRate = 24000;
+    const numChannels = 1;
+    const bitsPerSample = 16;
+    const byteRate = (sampleRate * numChannels * bitsPerSample) / 8;
+    const blockAlign = (numChannels * bitsPerSample) / 8;
+    const dataSize = rawBuffer.length;
+    const header = Buffer.alloc(44);
+    header.write('RIFF', 0);
+    header.writeUInt32LE(36 + dataSize, 4);
+    header.write('WAVE', 8);
+    header.write('fmt ', 12);
+    header.writeUInt32LE(16, 16);
+    header.writeUInt16LE(1, 20); // PCM
+    header.writeUInt16LE(numChannels, 22);
+    header.writeUInt32LE(sampleRate, 24);
+    header.writeUInt32LE(byteRate, 28);
+    header.writeUInt16LE(blockAlign, 32);
+    header.writeUInt16LE(bitsPerSample, 34);
+    header.write('data', 36);
+    header.writeUInt32LE(dataSize, 40);
+    return Buffer.concat([header, rawBuffer]);
+  }
+
+  return rawBuffer;
+}
+
+async function generateKazakhSpeechWav(
+  model: string,
+  text: string,
+  voiceName: string
+): Promise<Buffer> {
   const ai = getGenAIClient();
   const response = await ai.models.generateContent({
-    model: 'gemini-3.8-flash-lite-tts',
+    model,
     contents: [
       {
         role: 'user',
@@ -131,21 +182,21 @@ async function generateKazakhSpeechWav(text: string, voiceName: string): Promise
     },
   });
 
-  const base64Audio =
-    response.candidates?.[0]?.content?.parts?.[0]?.inlineData?.data;
+  const inlineData = response.candidates?.[0]?.content?.parts?.[0]?.inlineData;
+  const base64Audio = inlineData?.data;
 
   if (!base64Audio) {
     throw new Error('TTS моделі аудио деректерді қайтармады.');
   }
 
-  return Buffer.from(base64Audio, 'base64');
+  return ensureWavBuffer(Buffer.from(base64Audio, 'base64'), inlineData?.mimeType);
 }
 
 async function startServer() {
   const app = express();
   app.use(express.json({ limit: '1mb' }));
 
-  // POST /api/tts — Synthesize Kazakh documentary narration via Gemini 3.8 Flash Lite TTS
+  // POST /api/tts — Synthesize Kazakh documentary narration via Gemini 3.8 TTS
   app.post('/api/tts', async (req, res) => {
     try {
       const rawText = typeof req.body?.text === 'string' ? req.body.text.trim() : '';
@@ -171,36 +222,63 @@ async function startServer() {
         return;
       }
 
-      // 2. If recently rate-limited (429), respond cleanly without hammering upstream API
-      if (Date.now() < quotaCooldownUntil) {
+      // 2. Try available Gemini 3.8 TTS models (skipping any currently in 429 cooldown)
+      const now = Date.now();
+      const availableModels = TTS_MODELS.filter((m) => (modelCooldownUntil.get(m) ?? 0) <= now);
+
+      if (availableModels.length === 0) {
         res.status(429).json({
           code: 'QUOTA_EXHAUSTED',
           error:
-            'Gemini TTS тегін күндік лимиті (10 сұраныс) таусылды. Квотаны арттыру үшін Settings > Secrets бөлімінде биллинг қосылған API кілтін таңдаңыз немесе браузер дикторын қолданыңыз.',
+            'Gemini TTS тегін күндік лимиті таусылды. Квотаны арттыру үшін Settings > Secrets бөлімінде биллинг қосылған API кілтін таңдаңыз немесе браузер дикторын қолданыңыз.',
         });
         return;
       }
 
-      // 3. Call Gemini TTS (retry ONCE only for transient 5xx/network errors — NEVER on 4xx/429)
       let wavBuffer: Buffer | null = null;
       let lastErr: unknown = null;
-      for (let attempt = 0; attempt < 2; attempt++) {
+      let allQuota = true;
+
+      for (const model of availableModels) {
         try {
-          wavBuffer = await generateKazakhSpeechWav(rawText, voiceName);
+          wavBuffer = await generateKazakhSpeechWav(model, rawText, voiceName);
           break;
         } catch (err) {
           lastErr = err;
           const info = extractApiStatus(err);
-          if (info.status >= 400 && info.status < 500) {
-            break; // Never retry 400/403/429 client or quota errors
+          if (info.isQuota) {
+            // Cool down only this exhausted model and fail over to the next Gemini TTS model
+            modelCooldownUntil.set(model, Date.now() + 10 * 60 * 1000);
+            continue;
           }
-          if (attempt === 0) {
-            await new Promise((r) => setTimeout(r, 500));
+          allQuota = false;
+          if (info.status >= 400 && info.status < 500) {
+            break; // Never retry 400/403 client or auth errors
+          }
+          // Transient 5xx: retry once on the same model
+          await new Promise((r) => setTimeout(r, 450));
+          try {
+            wavBuffer = await generateKazakhSpeechWav(model, rawText, voiceName);
+            break;
+          } catch (retryErr) {
+            lastErr = retryErr;
+            const retryInfo = extractApiStatus(retryErr);
+            if (retryInfo.isQuota) {
+              modelCooldownUntil.set(model, Date.now() + 10 * 60 * 1000);
+            }
           }
         }
       }
 
       if (!wavBuffer) {
+        if (allQuota && lastErr) {
+          res.status(429).json({
+            code: 'QUOTA_EXHAUSTED',
+            error:
+              'Gemini TTS тегін күндік лимиті таусылды. Квотаны арттыру үшін Settings > Secrets бөлімінде биллинг қосылған API кілтін таңдаңыз немесе браузер дикторын қолданыңыз.',
+          });
+          return;
+        }
         throw lastErr ?? new Error('Дыбыстауды жасау сәтсіз аяқталды.');
       }
 
@@ -213,12 +291,10 @@ async function startServer() {
       const { status, isQuota, isAuth } = extractApiStatus(err);
 
       if (isQuota) {
-        // Cool down upstream requests for 10 minutes so repeated playback never spams 429
-        quotaCooldownUntil = Date.now() + 10 * 60 * 1000;
         res.status(429).json({
           code: 'QUOTA_EXHAUSTED',
           error:
-            'Gemini TTS тегін күндік лимиті (10 сұраныс) таусылды. Квотаны арттыру үшін Settings > Secrets бөлімінде биллинг қосылған API кілтін таңдаңыз немесе браузер дикторын қолданыңыз.',
+            'Gemini TTS тегін күндік лимиті таусылды. Квотаны арттыру үшін Settings > Secrets бөлімінде биллинг қосылған API кілтін таңдаңыз немесе браузер дикторын қолданыңыз.',
         });
         return;
       }

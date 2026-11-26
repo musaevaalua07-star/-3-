@@ -187,6 +187,7 @@ export default function App() {
 
   const handleSpeakStage = useCallback(
     (idx: number) => {
+      narrationRef.current?.unlockAudio();
       const clamped = Math.max(0, Math.min(PRESENTATION_STAGES.length - 1, idx));
       const st = PRESENTATION_STAGES[clamped];
       setIsPlaying(false);
@@ -205,6 +206,7 @@ export default function App() {
   );
 
   const handleReplayNarration = useCallback(() => {
+    narrationRef.current?.unlockAudio();
     const activeStage = PRESENTATION_STAGES[stageIndex];
     if (!activeStage) return;
     setNarrationError(null);
@@ -213,9 +215,19 @@ export default function App() {
   }, [stageIndex]);
 
   const handleUseBrowserNarration = useCallback(() => {
+    narrationRef.current?.unlockAudio();
     setNarrationProvider('browser');
     setNarrationError(null);
     setNarrationEnabled(true);
+  }, []);
+
+  const handleChangeProvider = useCallback((nextProvider: NarrationProvider) => {
+    narrationRef.current?.unlockAudio();
+    setNarrationProvider(nextProvider);
+    setNarrationError(null);
+    if (nextProvider === 'gemini') {
+      setNarrationQuotaExhausted(false);
+    }
   }, []);
 
   const handlePrevStage = useCallback(() => {
@@ -248,12 +260,14 @@ export default function App() {
     setActivePreset('collapseCloseup');
     controllerRef.current?.triggerCollapseReplay();
     if (narrationEnabled) {
+      narrationRef.current?.unlockAudio();
       const collapseStage = PRESENTATION_STAGES[3];
       void narrationRef.current?.speakStage(collapseStage.id, collapseStage.narrationText);
     }
   }, [narrationEnabled]);
 
   const handleToggleNarration = useCallback(() => {
+    narrationRef.current?.unlockAudio();
     setNarrationEnabled((prev) => {
       const next = !prev;
       if (next) {
@@ -372,6 +386,7 @@ export default function App() {
         onToggleUnderwaterView={() => setUnderwaterView((prev) => !prev)}
         onToggleNarration={handleToggleNarration}
         onUseBrowserNarration={handleUseBrowserNarration}
+        onChangeProvider={handleChangeProvider}
         onChangeVoice={setNarratorVoice}
         onReplayNarration={handleReplayNarration}
         onToggleDock={() => setDockCollapsed((prev) => !prev)}
