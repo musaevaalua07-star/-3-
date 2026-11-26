@@ -1,4 +1,5 @@
 import { GoogleGenAI } from '@google/genai';
+import crypto from 'crypto';
 import 'dotenv/config';
 import express from 'express';
 import fs from 'fs';
@@ -15,8 +16,52 @@ const isProd = process.env.NODE_ENV === 'production';
 // Allowed prebuilt voices for Gemini 3.8 TTS
 const ALLOWED_VOICES = new Set(['Charon', 'Kore', 'Puck', 'Fenrir', 'Zephyr']);
 
-// In-memory cache of synthesized WAV buffers so repeated playback is instant
-const ttsCache = new Map<string, Buffer>();
+// Persistent disk + in-memory cache so generated WAVs survive restarts and never re-use quota
+const CACHE_DIR = path.resolve(__dirname, '.cache', 'tts');
+const ttsMemoryCache = new Map<string, Buffer>();
+
+// Cooldown timestamp after receiving a 429 RESOURCE_EXHAUSTED to prevent upstream request spam
+let quotaCooldownUntil = 0;
+
+function ensureCacheDir(): void {
+  if (!fs.existsSync(CACHE_DIR)) {
+    fs.mkdirSync(CACHE_DIR, { recursive: true });
+  }
+}
+
+function getCacheHash(voiceName: string, text: string): string {
+  return crypto.createHash('sha256').update(`${voiceName}:${text}`).digest('hex');
+}
+
+function readCachedWav(hash: string): Buffer | null {
+  const mem = ttsMemoryCache.get(hash);
+  if (mem) return mem;
+  const filePath = path.join(CACHE_DIR, `${hash}.wav`);
+  if (fs.existsSync(filePath)) {
+    try {
+      const buf = fs.readFileSync(filePath);
+      ttsMemoryCache.set(hash, buf);
+      return buf;
+    } catch {
+      return null;
+    }
+  }
+  return null;
+}
+
+function writeCachedWav(hash: string, wavBuffer: Buffer): void {
+  if (ttsMemoryCache.size > 40) {
+    const firstKey = ttsMemoryCache.keys().next().value;
+    if (firstKey) ttsMemoryCache.delete(firstKey);
+  }
+  ttsMemoryCache.set(hash, wavBuffer);
+  try {
+    ensureCacheDir();
+    fs.writeFileSync(path.join(CACHE_DIR, `${hash}.wav`), wavBuffer);
+  } catch {
+    // Non-fatal if filesystem cache cannot be written
+  }
+}
 
 function getGenAIClient(): GoogleGenAI {
   const apiKey = process.env.GEMINI_API_KEY;
@@ -32,6 +77,30 @@ function getGenAIClient(): GoogleGenAI {
       },
     },
   });
+}
+
+function extractApiStatus(err: unknown): { status: number; isQuota: boolean; isAuth: boolean } {
+  const anyErr = err as { status?: number; code?: number; message?: string };
+  const msg = typeof anyErr?.message === 'string' ? anyErr.message : String(err ?? '');
+  const statusNum = Number(anyErr?.status || anyErr?.code || 0);
+
+  const isQuota =
+    statusNum === 429 ||
+    msg.includes('RESOURCE_EXHAUSTED') ||
+    msg.includes('"code":429') ||
+    msg.toLowerCase().includes('quota');
+
+  const isAuth =
+    statusNum === 403 ||
+    msg.includes('PERMISSION_DENIED') ||
+    msg.includes('API_KEY_INVALID') ||
+    msg.includes('GEMINI_API_KEY');
+
+  return {
+    status: isQuota ? 429 : isAuth ? 403 : statusNum >= 400 && statusNum < 600 ? statusNum : 500,
+    isQuota,
+    isAuth,
+  };
 }
 
 async function generateKazakhSpeechWav(text: string, voiceName: string): Promise<Buffer> {
@@ -81,27 +150,38 @@ async function startServer() {
     try {
       const rawText = typeof req.body?.text === 'string' ? req.body.text.trim() : '';
       const rawVoice = typeof req.body?.voiceName === 'string' ? req.body.voiceName : 'Charon';
-      const stageId = typeof req.body?.stageId === 'number' ? req.body.stageId : -1;
 
       if (!rawText || rawText.length > 1200) {
         res.status(400).json({
+          code: 'INVALID_INPUT',
           error: 'Дыбыстау мәтіні бос немесе тым ұзын (максимум 1200 таңба).',
         });
         return;
       }
 
       const voiceName = ALLOWED_VOICES.has(rawVoice) ? rawVoice : 'Charon';
-      const cacheKey = `${stageId}:${voiceName}:${rawText}`;
+      const cacheHash = getCacheHash(voiceName, rawText);
 
-      const cached = ttsCache.get(cacheKey);
+      // 1. Always serve from persistent disk/memory cache first (uses zero API quota)
+      const cached = readCachedWav(cacheHash);
       if (cached) {
         res.setHeader('Content-Type', 'audio/wav');
-        res.setHeader('Cache-Control', 'public, max-age=3600');
+        res.setHeader('Cache-Control', 'public, max-age=86400');
         res.send(cached);
         return;
       }
 
-      // Retry once on transient network/5xx errors
+      // 2. If recently rate-limited (429), respond cleanly without hammering upstream API
+      if (Date.now() < quotaCooldownUntil) {
+        res.status(429).json({
+          code: 'QUOTA_EXHAUSTED',
+          error:
+            'Gemini TTS тегін күндік лимиті (10 сұраныс) таусылды. Квотаны арттыру үшін Settings > Secrets бөлімінде биллинг қосылған API кілтін таңдаңыз немесе браузер дикторын қолданыңыз.',
+        });
+        return;
+      }
+
+      // 3. Call Gemini TTS (retry ONCE only for transient 5xx/network errors — NEVER on 4xx/429)
       let wavBuffer: Buffer | null = null;
       let lastErr: unknown = null;
       for (let attempt = 0; attempt < 2; attempt++) {
@@ -110,8 +190,12 @@ async function startServer() {
           break;
         } catch (err) {
           lastErr = err;
+          const info = extractApiStatus(err);
+          if (info.status >= 400 && info.status < 500) {
+            break; // Never retry 400/403/429 client or quota errors
+          }
           if (attempt === 0) {
-            await new Promise((r) => setTimeout(r, 450));
+            await new Promise((r) => setTimeout(r, 500));
           }
         }
       }
@@ -120,25 +204,38 @@ async function startServer() {
         throw lastErr ?? new Error('Дыбыстауды жасау сәтсіз аяқталды.');
       }
 
-      // Cap cache size to prevent unbounded memory growth
-      if (ttsCache.size > 40) {
-        const firstKey = ttsCache.keys().next().value;
-        if (firstKey) ttsCache.delete(firstKey);
-      }
-      ttsCache.set(cacheKey, wavBuffer);
+      writeCachedWav(cacheHash, wavBuffer);
 
       res.setHeader('Content-Type', 'audio/wav');
-      res.setHeader('Cache-Control', 'public, max-age=3600');
+      res.setHeader('Cache-Control', 'public, max-age=86400');
       res.send(wavBuffer);
     } catch (err: unknown) {
+      const { status, isQuota, isAuth } = extractApiStatus(err);
+
+      if (isQuota) {
+        // Cool down upstream requests for 10 minutes so repeated playback never spams 429
+        quotaCooldownUntil = Date.now() + 10 * 60 * 1000;
+        res.status(429).json({
+          code: 'QUOTA_EXHAUSTED',
+          error:
+            'Gemini TTS тегін күндік лимиті (10 сұраныс) таусылды. Квотаны арттыру үшін Settings > Secrets бөлімінде биллинг қосылған API кілтін таңдаңыз немесе браузер дикторын қолданыңыз.',
+        });
+        return;
+      }
+
+      if (isAuth) {
+        res.status(403).json({
+          code: 'AUTH_ERROR',
+          error:
+            'Gemini API кілті дұрыс орнатылмаған. Settings > Secrets бөлімінен API кілтін тексеріңіз.',
+        });
+        return;
+      }
+
+      console.error('[TTS API Error]:', err);
       const message =
         err instanceof Error ? err.message : 'Қазақша дыбыстау серверінде қате орын алды.';
-      console.error('[TTS API Error]:', err);
-      const status =
-        message.includes('API_KEY') || message.includes('403') || message.includes('PERMISSION_DENIED')
-          ? 503
-          : 500;
-      res.status(status).json({ error: message });
+      res.status(status).json({ code: 'TTS_ERROR', error: message });
     }
   });
 

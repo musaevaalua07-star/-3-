@@ -25,7 +25,11 @@ import {
   PRESENTATION_STAGES,
   type CameraPresetId,
 } from '../data/presentationData';
-import type { NarrationStatus, NarratorVoice } from '../scene/narrationEngine';
+import type {
+  NarrationProvider,
+  NarrationStatus,
+  NarratorVoice,
+} from '../scene/narrationEngine';
 
 interface OverlayHUDProps {
   stageIndex: number;
@@ -41,6 +45,8 @@ interface OverlayHUDProps {
   narrationEnabled: boolean;
   narrationStatus: NarrationStatus;
   narrationError: string | null;
+  narrationQuotaExhausted: boolean;
+  narrationProvider: NarrationProvider;
   narratorVoice: NarratorVoice;
   dockCollapsed: boolean;
   storyCollapsed: boolean;
@@ -59,6 +65,7 @@ interface OverlayHUDProps {
   onToggleAudio: () => void;
   onToggleUnderwaterView: () => void;
   onToggleNarration: () => void;
+  onUseBrowserNarration: () => void;
   onChangeVoice: (voice: NarratorVoice) => void;
   onReplayNarration: () => void;
   onToggleDock: () => void;
@@ -80,6 +87,8 @@ export function OverlayHUD({
   narrationEnabled,
   narrationStatus,
   narrationError,
+  narrationQuotaExhausted,
+  narrationProvider,
   narratorVoice,
   dockCollapsed,
   storyCollapsed,
@@ -98,6 +107,7 @@ export function OverlayHUD({
   onToggleAudio,
   onToggleUnderwaterView,
   onToggleNarration,
+  onUseBrowserNarration,
   onChangeVoice,
   onReplayNarration,
   onToggleDock,
@@ -260,7 +270,11 @@ export function OverlayHUD({
 
               {narrationEnabled && narrationStatus === 'speaking' && (
                 <div className="flex items-center justify-between gap-2 text-[11px] text-emerald-300/95">
-                  <span>Диктор осы кезеңді түсіндіріп жатыр</span>
+                  <span>
+                    {narrationProvider === 'browser'
+                      ? 'Браузер дикторы түсіндіріп жатыр'
+                      : 'Диктор осы кезеңді түсіндіріп жатыр'}
+                  </span>
                   <button
                     type="button"
                     onClick={onReplayNarration}
@@ -272,9 +286,20 @@ export function OverlayHUD({
               )}
 
               {narrationStatus === 'error' && narrationError && (
-                <p className="text-[11px] text-rose-300 leading-snug" role="alert">
-                  {narrationError}
-                </p>
+                <div className="space-y-2" role="alert">
+                  <p className="text-[11px] text-rose-300 leading-snug">
+                    {narrationError}
+                  </p>
+                  {narrationQuotaExhausted && narrationProvider !== 'browser' && (
+                    <button
+                      type="button"
+                      onClick={onUseBrowserNarration}
+                      className="px-2.5 py-1.5 text-[11px] font-medium rounded-md border border-sky-400/40 bg-sky-500/15 text-sky-200 hover:bg-sky-500/25 transition-colors cursor-pointer whitespace-nowrap"
+                    >
+                      Браузер дикторына ауысу
+                    </button>
+                  )}
+                </div>
               )}
             </div>
 

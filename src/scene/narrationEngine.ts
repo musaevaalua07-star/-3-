@@ -1,15 +1,28 @@
 export type NarratorVoice = 'Charon' | 'Kore';
-
+export type NarrationProvider = 'gemini' | 'browser';
 export type NarrationStatus = 'idle' | 'loading' | 'speaking' | 'error';
 
 export interface NarrationCallbacks {
-  onStatusChange: (status: NarrationStatus, errorMessage?: string) => void;
+  onStatusChange: (
+    status: NarrationStatus,
+    errorMessage?: string,
+    quotaExhausted?: boolean
+  ) => void;
   onStageFinished: (stageId: number) => void;
 }
 
+class TtsQuotaError extends Error {
+  public readonly quotaExhausted = true;
+  constructor(message: string) {
+    super(message);
+    this.name = 'TtsQuotaError';
+  }
+}
+
 /**
- * Manages Kazakh voiceover narration fetched from server-side /api/tts
- * with client-side Blob URL caching, stage pre-fetching, and clean playback control.
+ * Manages Kazakh voiceover narration via server-side Gemini TTS (/api/tts)
+ * with client-side Blob caching, quota-safe error handling (no aggressive prefetch
+ * or 429 retry loops), and an explicit opt-in Browser SpeechSynthesis mode.
  */
 export class KazakhNarrationEngine {
   private audioEl: HTMLAudioElement;
@@ -18,6 +31,7 @@ export class KazakhNarrationEngine {
   private currentRequestToken = 0;
   private activeStageId = -1;
   private voice: NarratorVoice = 'Charon';
+  private provider: NarrationProvider = 'gemini';
   private callbacks: NarrationCallbacks;
   private isSpeakingNow = false;
 
@@ -41,12 +55,16 @@ export class KazakhNarrationEngine {
 
     this.audioEl.addEventListener('error', () => {
       this.isSpeakingNow = false;
-      this.callbacks.onStatusChange('error', 'Аудио ойнату кезінде қате шықты.');
+      this.callbacks.onStatusChange('error', 'Аудио ойнату кезінде қате шықты.', false);
     });
   }
 
   public setVoice(nextVoice: NarratorVoice): void {
     this.voice = nextVoice;
+  }
+
+  public setProvider(nextProvider: NarrationProvider): void {
+    this.provider = nextProvider;
   }
 
   public isBusy(): boolean {
@@ -77,12 +95,17 @@ export class KazakhNarrationEngine {
       });
 
       if (!response.ok) {
-        let errText = 'Дыбыстау қызметі қолжетімсіз.';
+        let errText = 'Дыбыстау қызметі уақытша қолжетімсіз.';
+        let errCode = '';
         try {
-          const data = (await response.json()) as { error?: string };
+          const data = (await response.json()) as { error?: string; code?: string };
           if (data?.error) errText = data.error;
+          if (data?.code) errCode = data.code;
         } catch {
-          // ignore JSON parse errors
+          // ignore parse error
+        }
+        if (response.status === 429 || errCode === 'QUOTA_EXHAUSTED') {
+          throw new TtsQuotaError(errText);
         }
         throw new Error(errText);
       }
@@ -101,13 +124,52 @@ export class KazakhNarrationEngine {
     }
   }
 
-  /** Pre-warm the next stage's Kazakh voiceover in the background */
-  public prefetch(stageId: number, text: string): void {
-    const key = this.getCacheKey(stageId, this.voice);
-    if (this.blobCache.has(key) || this.inflight.has(key)) return;
-    void this.fetchAudioUrl(stageId, text, this.voice).catch(() => {
-      // silent prefetch failure; active speak() surfaces errors properly
-    });
+  private speakBrowser(stageId: number, text: string, token: number): void {
+    if (typeof window === 'undefined' || !('speechSynthesis' in window)) {
+      this.callbacks.onStatusChange(
+        'error',
+        'Бұл браузерде кіріктірілген дауыстап оқу қолжетімді емес.',
+        false
+      );
+      return;
+    }
+
+    window.speechSynthesis.cancel();
+    const utterance = new SpeechSynthesisUtterance(text);
+    utterance.lang = 'kk-KZ';
+    utterance.rate = 0.96;
+    utterance.pitch = this.voice === 'Kore' ? 1.08 : 0.92;
+
+    const voices = window.speechSynthesis.getVoices();
+    const kkVoice = voices.find((v) => v.lang.toLowerCase().startsWith('kk'));
+    if (kkVoice) {
+      utterance.voice = kkVoice;
+    }
+
+    utterance.onstart = () => {
+      if (token !== this.currentRequestToken) return;
+      this.isSpeakingNow = true;
+      this.callbacks.onStatusChange('speaking');
+    };
+
+    utterance.onend = () => {
+      if (token !== this.currentRequestToken) return;
+      this.isSpeakingNow = false;
+      this.callbacks.onStatusChange('idle');
+      this.callbacks.onStageFinished(stageId);
+    };
+
+    utterance.onerror = () => {
+      if (token !== this.currentRequestToken) return;
+      this.isSpeakingNow = false;
+      this.callbacks.onStatusChange(
+        'error',
+        'Браузер дикторы мәтінді оқи алмады.',
+        false
+      );
+    };
+
+    window.speechSynthesis.speak(utterance);
   }
 
   public async speakStage(stageId: number, text: string): Promise<void> {
@@ -116,12 +178,20 @@ export class KazakhNarrationEngine {
 
     this.audioEl.pause();
     this.audioEl.currentTime = 0;
+    if (typeof window !== 'undefined' && 'speechSynthesis' in window) {
+      window.speechSynthesis.cancel();
+    }
     this.isSpeakingNow = false;
+
+    if (this.provider === 'browser') {
+      this.speakBrowser(stageId, text, token);
+      return;
+    }
+
     this.callbacks.onStatusChange('loading');
 
     try {
       const url = await this.fetchAudioUrl(stageId, text, this.voice);
-      // Discard stale request if user jumped to another stage or stopped narration
       if (token !== this.currentRequestToken) return;
 
       this.audioEl.src = url;
@@ -130,9 +200,10 @@ export class KazakhNarrationEngine {
     } catch (err: unknown) {
       if (token !== this.currentRequestToken) return;
       this.isSpeakingNow = false;
+      const isQuota = err instanceof TtsQuotaError;
       const msg =
         err instanceof Error ? err.message : 'Қазақша дыбыстауды жүктеу сәтсіз аяқталды.';
-      this.callbacks.onStatusChange('error', msg);
+      this.callbacks.onStatusChange('error', msg, isQuota);
     }
   }
 
@@ -142,6 +213,9 @@ export class KazakhNarrationEngine {
     this.isSpeakingNow = false;
     this.audioEl.pause();
     this.audioEl.currentTime = 0;
+    if (typeof window !== 'undefined' && 'speechSynthesis' in window) {
+      window.speechSynthesis.cancel();
+    }
     this.callbacks.onStatusChange('idle');
   }
 

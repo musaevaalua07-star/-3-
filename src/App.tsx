@@ -8,6 +8,7 @@ import {
 } from './scene/AbrasionSceneController';
 import {
   KazakhNarrationEngine,
+  type NarrationProvider,
   type NarrationStatus,
   type NarratorVoice,
 } from './scene/narrationEngine';
@@ -41,6 +42,8 @@ export default function App() {
   const [narrationEnabled, setNarrationEnabled] = useState(false);
   const [narrationStatus, setNarrationStatus] = useState<NarrationStatus>('idle');
   const [narrationError, setNarrationError] = useState<string | null>(null);
+  const [narrationQuotaExhausted, setNarrationQuotaExhausted] = useState(false);
+  const [narrationProvider, setNarrationProvider] = useState<NarrationProvider>('gemini');
   const [narratorVoice, setNarratorVoice] = useState<NarratorVoice>('Charon');
 
   const [dockCollapsed, setDockCollapsed] = useState(false);
@@ -51,9 +54,14 @@ export default function App() {
   // Initialize Kazakh Narration Engine once
   useEffect(() => {
     const engine = new KazakhNarrationEngine({
-      onStatusChange: (status, errMsg) => {
+      onStatusChange: (status, errMsg, quotaExhausted) => {
         setNarrationStatus(status);
         setNarrationError(errMsg ?? null);
+        if (quotaExhausted) {
+          setNarrationQuotaExhausted(true);
+          // Automatically disable auto-fetching Gemini TTS on subsequent stage loops
+          setNarrationEnabled(false);
+        }
         const busy = status === 'loading' || status === 'speaking';
         controllerRef.current?.setNarrationBusy(busy);
       },
@@ -146,12 +154,13 @@ export default function App() {
     underwaterView,
   ]);
 
-  // Synchronize Kazakh voiceover whenever stageIndex, narrationEnabled, or narratorVoice changes
+  // Synchronize Kazakh voiceover whenever stageIndex, narrationEnabled, provider, or voice changes
   useEffect(() => {
     const engine = narrationRef.current;
     if (!engine) return;
 
     engine.setVoice(narratorVoice);
+    engine.setProvider(narrationProvider);
 
     if (!narrationEnabled) {
       engine.stop();
@@ -163,13 +172,7 @@ export default function App() {
     if (!activeStage) return;
 
     void engine.speakStage(activeStage.id, activeStage.narrationText);
-
-    // Pre-fetch the next stage's Kazakh voiceover for seamless transitions
-    const nextStage = PRESENTATION_STAGES[(stageIndex + 1) % PRESENTATION_STAGES.length];
-    if (nextStage) {
-      engine.prefetch(nextStage.id, nextStage.narrationText);
-    }
-  }, [stageIndex, narrationEnabled, narratorVoice]);
+  }, [stageIndex, narrationEnabled, narrationProvider, narratorVoice]);
 
   const handleSelectStage = useCallback((idx: number) => {
     const clamped = Math.max(0, Math.min(PRESENTATION_STAGES.length - 1, idx));
@@ -182,28 +185,38 @@ export default function App() {
     controllerRef.current?.flyToPreset(st.cameraPreset);
   }, []);
 
-  const handleSpeakStage = useCallback((idx: number) => {
-    const clamped = Math.max(0, Math.min(PRESENTATION_STAGES.length - 1, idx));
-    const st = PRESENTATION_STAGES[clamped];
-    setIsPlaying(false);
-    setStageIndex(clamped);
-    setProgress(st.targetProgress);
-    setWavePower(st.recommendedWavePower);
-    setActivePreset(st.cameraPreset);
-    setNarrationEnabled(true);
-    controllerRef.current?.flyToPreset(st.cameraPreset);
-    // If already on the same stage and narration was already on, replay explicitly
-    if (clamped === stageIndex && narrationEnabled) {
-      void narrationRef.current?.speakStage(st.id, st.narrationText);
-    }
-  }, [stageIndex, narrationEnabled]);
+  const handleSpeakStage = useCallback(
+    (idx: number) => {
+      const clamped = Math.max(0, Math.min(PRESENTATION_STAGES.length - 1, idx));
+      const st = PRESENTATION_STAGES[clamped];
+      setIsPlaying(false);
+      setStageIndex(clamped);
+      setProgress(st.targetProgress);
+      setWavePower(st.recommendedWavePower);
+      setActivePreset(st.cameraPreset);
+      setNarrationError(null);
+      setNarrationEnabled(true);
+      controllerRef.current?.flyToPreset(st.cameraPreset);
+      if (clamped === stageIndex && narrationEnabled) {
+        void narrationRef.current?.speakStage(st.id, st.narrationText);
+      }
+    },
+    [stageIndex, narrationEnabled]
+  );
 
   const handleReplayNarration = useCallback(() => {
     const activeStage = PRESENTATION_STAGES[stageIndex];
     if (!activeStage) return;
+    setNarrationError(null);
     setNarrationEnabled(true);
     void narrationRef.current?.speakStage(activeStage.id, activeStage.narrationText);
   }, [stageIndex]);
+
+  const handleUseBrowserNarration = useCallback(() => {
+    setNarrationProvider('browser');
+    setNarrationError(null);
+    setNarrationEnabled(true);
+  }, []);
 
   const handlePrevStage = useCallback(() => {
     handleSelectStage((stageIndex - 1 + PRESENTATION_STAGES.length) % PRESENTATION_STAGES.length);
@@ -243,9 +256,11 @@ export default function App() {
   const handleToggleNarration = useCallback(() => {
     setNarrationEnabled((prev) => {
       const next = !prev;
-      if (next && !audioEnabled) {
-        // Gently bring in ambient ocean surf bed along with the narrator
-        setAudioEnabled(true);
+      if (next) {
+        setNarrationError(null);
+        if (!audioEnabled) {
+          setAudioEnabled(true);
+        }
       }
       return next;
     });
@@ -336,6 +351,8 @@ export default function App() {
         narrationEnabled={narrationEnabled}
         narrationStatus={narrationStatus}
         narrationError={narrationError}
+        narrationQuotaExhausted={narrationQuotaExhausted}
+        narrationProvider={narrationProvider}
         narratorVoice={narratorVoice}
         dockCollapsed={dockCollapsed}
         storyCollapsed={storyCollapsed}
@@ -354,6 +371,7 @@ export default function App() {
         onToggleAudio={() => setAudioEnabled((prev) => !prev)}
         onToggleUnderwaterView={() => setUnderwaterView((prev) => !prev)}
         onToggleNarration={handleToggleNarration}
+        onUseBrowserNarration={handleUseBrowserNarration}
         onChangeVoice={setNarratorVoice}
         onReplayNarration={handleReplayNarration}
         onToggleDock={() => setDockCollapsed((prev) => !prev)}
